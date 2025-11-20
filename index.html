@@ -1,0 +1,20 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>ATR TP Calculator</title>
+</head>
+<body>
+  <h1>ATR-Based Take Profit Calculator</h1>
+  
+  <label>Pair: <input type="text" id="pair" placeholder="EURUSD"></label><br><br>
+  <label>ATR (200) value: <input type="number" id="atr" step="0.0001" placeholder="0.0084"></label><br><br>
+  <label>TP % (0.10 = 10%): <input type="number" id="tpPercent" step="0.01" placeholder="0.15"></label><br><br>
+  <button onclick="calculateTP()">Calculate TP</button>
+
+  <h2 id="result"></h2>
+
+  <script src="script.js"></script>
+</body>
+</html>
