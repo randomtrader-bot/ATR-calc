@@ -1,116 +1,111 @@
 import streamlit as st
 import yfinance as yf
 import pandas as pd
-import datetime
 
-# --- Page Config ---
-st.set_page_config(page_title="Daily ATR Calculator", layout="centered")
+# --- Page Configuration ---
+st.set_page_config(page_title="Pip Distance Calculator", layout="centered")
 
 # --- Helper Functions ---
 
-def get_pip_settings(pair):
+def get_pip_unit(pair):
     """
-    Returns the pip unit and formatting precision.
-    EUR/USD: 0.0001
-    USD/JPY: 0.01
+    Returns the pip unit value.
+    EUR/USD = 0.0001
+    USD/JPY = 0.01
     """
     if "JPY" in pair:
-        return 0.01, "{:.3f}", "{:.1f}"
-    else:
-        return 0.0001, "{:.5f}", "{:.1f}"
+        return 0.01
+    return 0.0001
 
-def fetch_data(symbol):
-    # 1. Get Daily History for ATR (last 3 months to be safe)
-    daily_df = yf.download(symbol, period="3mo", interval="1d", progress=False)
-    # 2. Get Live Minute Data for Price (last 1 day)
-    live_df = yf.download(symbol, period="1d", interval="1m", progress=False)
-    return daily_df, live_df
+# --- Data Fetching (Cached) ---
+# ttl=1800 means the cache lives for 1800 seconds (30 minutes).
+# After 30 mins, the next user action triggers a new download.
+@st.cache_data(ttl=1800, show_spinner=False)
+def get_daily_atr_pips(symbol, pip_unit):
+    """
+    Downloads Daily data and returns the current 14-Day ATR in PIPS.
+    """
+    # Fetch 3 months to ensure plenty of data for the 14-day average
+    df = yf.download(symbol, period="3mo", interval="1d", progress=False)
+    
+    if df.empty:
+        return None
 
-def calculate_daily_atr(df, period=14):
+    # Calculate True Range
     df['h_l'] = df['High'] - df['Low']
     df['h_pc'] = (df['High'] - df['Close'].shift(1)).abs()
     df['l_pc'] = (df['Low'] - df['Close'].shift(1)).abs()
     df['TR'] = df[['h_l', 'h_pc', 'l_pc']].max(axis=1)
-    df['ATR'] = df['TR'].rolling(window=period).mean()
-    return df
+    
+    # Calculate 14-Day ATR
+    df['ATR'] = df['TR'].rolling(window=14).mean()
+    
+    # Get the latest ATR value
+    current_atr_price = float(df['ATR'].iloc[-1])
+    
+    # Convert to Pips
+    atr_in_pips = current_atr_price / pip_unit
+    return atr_in_pips
 
 # --- UI Layout ---
 
-st.title("Standard Daily ATR Calculator")
+st.title("🛡️ ATR Risk Calculator")
+st.markdown("Calculates **Stop Loss** and **Take Profit** distances in pips based on Daily Volatility.")
 
-# --- Sidebar Inputs ---
-with st.sidebar:
-    st.header("Settings")
-    pair_option = st.radio("Select Pair", ["EUR/USD", "USD/JPY"])
-    
-    st.divider()
-    
-    # CHANGED: Step size is now 0.01
-    sl_mult = st.number_input("SL Multiplier", value=0.50, step=0.01, format="%.2f")
-    tp_mult = st.number_input("TP Multiplier", value=1.00, step=0.01, format="%.2f")
+# --- 1. Settings (Top Section) ---
+col_pair, col_atr = st.columns([1, 1])
 
-# --- Main Logic ---
+with col_pair:
+    pair_option = st.radio("Select Pair:", ["EUR/USD", "USD/JPY"], horizontal=True)
 
+# Map selection to ticker
 symbol_map = {"EUR/USD": "EURUSD=X", "USD/JPY": "JPY=X"}
 ticker = symbol_map[pair_option]
-pip_unit, price_fmt, pip_fmt = get_pip_settings(pair_option)
+pip_unit = get_pip_unit(pair_option)
 
-if st.button("Get Live Data", type="primary"):
+# --- 2. Data Fetching (Automatic) ---
+try:
+    # This runs instantly if data is cached (under 30 mins old)
+    atr_pips = get_daily_atr_pips(ticker, pip_unit)
     
-    try:
-        with st.spinner("Syncing..."):
-            daily_data, live_data = fetch_data(ticker)
+    if atr_pips is None:
+        st.error("Error: Could not fetch market data.")
+    else:
+        with col_atr:
+            # Show the base ATR just for reference, small and grey
+            st.metric(label="Market Volatility (Daily)", value=f"{atr_pips:.1f} pips")
+
+        st.divider()
+
+        # --- 3. Multipliers (The Control Panel) ---
+        st.subheader("Multiplier Settings")
         
-        if daily_data.empty or live_data.empty:
-            st.error("Market data unavailable.")
-        else:
-            # 1. Calculate ATR
-            daily_data = calculate_daily_atr(daily_data)
-            current_atr_val = float(daily_data['ATR'].iloc[-1])
-            atr_in_pips = current_atr_val / pip_unit
-            
-            # 2. Get Live Price
-            current_price = float(live_data['Close'].iloc[-1])
-            last_date = daily_data.index[-1].strftime("%Y-%m-%d")
+        c1, c2 = st.columns(2)
+        
+        with c1:
+            # Step is 0.01 for precision
+            sl_mult = st.number_input("SL Multiplier", value=0.50, step=0.01, format="%.2f")
+        
+        with c2:
+            tp_mult = st.number_input("TP Multiplier", value=1.00, step=0.01, format="%.2f")
 
-            # --- Metrics Display ---
-            st.divider()
-            m1, m2, m3 = st.columns(3)
-            m1.metric("Live Price", price_fmt.format(current_price))
-            m2.metric("Daily ATR", f"{pip_fmt.format(atr_in_pips)} pips")
-            m3.metric("Date", last_date)
-            
-            # --- Calculation ---
-            sl_dist = current_atr_val * sl_mult
-            tp_dist = current_atr_val * tp_mult
-            
-            # Long Calcs
-            long_sl = current_price - sl_dist
-            long_tp = current_price + tp_dist
-            
-            # Short Calcs
-            short_sl = current_price + sl_dist
-            short_tp = current_price - tp_dist
+        # --- 4. The Results (Instant Calculation) ---
+        
+        # Calculate distances based on inputs
+        final_sl_pips = atr_pips * sl_mult
+        final_tp_pips = atr_pips * tp_mult
 
-            # --- NEW: Simplified Table Display ---
-            st.subheader("Calculated Targets")
+        st.divider()
+        st.subheader("Target Distances")
 
-            # Create a simple list of dictionaries for the table
-            table_data = [
-                {
-                    "Direction": "LONG (Buy)",
-                    "Stop Loss": price_fmt.format(long_sl),
-                    "Take Profit": price_fmt.format(long_tp)
-                },
-                {
-                    "Direction": "SHORT (Sell)",
-                    "Stop Loss": price_fmt.format(short_sl),
-                    "Take Profit": price_fmt.format(short_tp)
-                }
-            ]
+        # Display Big Bold Metrics
+        res_col1, res_col2 = st.columns(2)
+        
+        with res_col1:
+            st.error(f"🛑 STOP LOSS\n# {final_sl_pips:.1f} pips")
+            
+        with res_col2:
+            st.success(f"🎯 TAKE PROFIT\n# {final_tp_pips:.1f} pips")
 
-            # Display as a clean, static table
-            st.table(table_data)
-                
-    except Exception as e:
-        st.error(f"Error: {e}")
+except Exception as e:
+    st.error(f"System Error: {e}")
