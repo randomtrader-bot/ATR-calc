@@ -4,3 +4,4 @@ pandas
 pytz
 beautifulsoup4
 requests
+numpy
