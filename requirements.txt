@@ -1,7 +1,8 @@
 streamlit
 yfinance
 pandas
+numpy
 pytz
 beautifulsoup4
 requests
-numpy
+lxml
