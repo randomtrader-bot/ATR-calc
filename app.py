@@ -5,16 +5,16 @@ import numpy as np
 import pytz
 import requests
 from bs4 import BeautifulSoup
-from datetime import datetime, timedelta
+from datetime import datetime, time, timedelta
 
 # --- Page Configuration ---
-st.set_page_config(page_title="Forex Risk Dashboard", layout="centered", page_icon="🛡️")
+st.set_page_config(page_title="Forex Safety Shield", layout="centered", page_icon="🛡️")
 
-# --- Configuration & Constants ---
+# --- Constants & Configuration ---
 USER_TIMEZONE = pytz.timezone('Europe/Riga')
 NEWS_URL = "https://finviz.com/calendar.ashx"
 
-# The "White List" - App only cares about these events
+# Whitelist: Critical Events + Liquidity Killers
 IMPORTANT_KEYWORDS = [
     "CPI", "Consumer Price Index",
     "GDP", "Gross Domestic Product",
@@ -22,7 +22,8 @@ IMPORTANT_KEYWORDS = [
     "Unemployment Rate",
     "Interest Rate", "Policy Rate", "Minimum Bid Rate",
     "FOMC", "Monetary Policy",
-    "Speaks", "Testifies", "Chair", "President"
+    "Speaks", "Testifies", "Chair", "President",
+    "Holiday", "Closed", "Observance" 
 ]
 
 HEADERS = {
@@ -32,8 +33,7 @@ HEADERS = {
 # --- Helper Functions ---
 
 def get_pip_unit(pair):
-    if "JPY" in pair:
-        return 0.01
+    if "JPY" in pair: return 0.01
     return 0.0001
 
 def calculate_rsi(series, period=14):
@@ -56,7 +56,7 @@ def convert_to_latvia_time(time_str_est):
     except:
         return None
 
-# --- Data Engine 1: News Scraper (Cached 1h) ---
+# --- Data Engine 1: News (Cached 1h) ---
 
 @st.cache_data(ttl=3600, show_spinner=False)
 def fetch_news(pair):
@@ -66,7 +66,8 @@ def fetch_news(pair):
     fetch_time = datetime.now(USER_TIMEZONE).strftime("%H:%M")
     
     try:
-        response = requests.get(NEWS_URL, headers=HEADERS, timeout=5)
+        # FIX: Increased timeout to 15s for mobile reliability
+        response = requests.get(NEWS_URL, headers=HEADERS, timeout=15)
         if response.status_code != 200:
             return [], [], True, fetch_time
             
@@ -94,7 +95,6 @@ def fetch_news(pair):
             if event_dt is None: continue
             
             # Filter 4: 24-Hour Lookahead Only
-            # If event is older than 24h or more than 24h in future, ignore
             if abs((event_dt - current_riga_time).total_seconds()) > 86400:
                 continue
             
@@ -112,83 +112,135 @@ def fetch_news(pair):
     except Exception as e:
         return [], [], True, fetch_time
 
-# --- Data Engine 2: Technical Analysis (Cached 30m) ---
+# --- Data Engine 2: Market Data (Cached 30m) ---
 
 @st.cache_data(ttl=1800, show_spinner=False)
-def get_technical_analysis(symbol, pip_unit):
+def get_market_data(symbol, pip_unit):
     try:
-        # Fetch data (6mo for valid moving averages)
-        df = yf.download(symbol, period="6mo", interval="1d", progress=False)
-        if df.empty: return None
+        # 1. Fetch Daily Data (For ATR)
+        df_daily = yf.download(symbol, period="2mo", interval="1d", progress=False, auto_adjust=False)
+        if isinstance(df_daily.columns, pd.MultiIndex):
+            df_daily.columns = df_daily.columns.get_level_values(0)
+            
+        # 2. Fetch M30 Data (For RSI)
+        df_m30 = yf.download(symbol, period="5d", interval="30m", progress=False, auto_adjust=False)
+        if isinstance(df_m30.columns, pd.MultiIndex):
+            df_m30.columns = df_m30.columns.get_level_values(0)
+
+        if df_daily.empty or df_m30.empty: 
+            return {"error": "No data returned from Yahoo Finance."}
         
-        # 1. ATR Calculation (14)
-        df['h_l'] = df['High'] - df['Low']
-        df['h_pc'] = (df['High'] - df['Close'].shift(1)).abs()
-        df['l_pc'] = (df['Low'] - df['Close'].shift(1)).abs()
-        df['TR'] = df[['h_l', 'h_pc', 'l_pc']].max(axis=1)
-        df['ATR'] = df['TR'].rolling(window=14).mean()
+        # --- CALC 1: Daily ATR (14) ---
+        df_daily['h_l'] = df_daily['High'] - df_daily['Low']
+        df_daily['h_pc'] = (df_daily['High'] - df_daily['Close'].shift(1)).abs()
+        df_daily['l_pc'] = (df_daily['Low'] - df_daily['Close'].shift(1)).abs()
+        df_daily['TR'] = df_daily[['h_l', 'h_pc', 'l_pc']].max(axis=1)
+        df_daily['ATR'] = df_daily['TR'].rolling(window=14).mean()
         
-        # 2. SMA 50 (Trend)
-        df['SMA_50'] = df['Close'].rolling(window=50).mean()
+        # FIX: Use iloc[-2] (Yesterday's Closed Candle) for stable sizing
+        # iloc[-1] is the live candle which starts at 0 and causes "Shrinking Ruler" bug
+        current_atr_val = float(df_daily['ATR'].iloc[-2])
         
-        # 3. RSI 14 (Momentum)
-        df['RSI'] = calculate_rsi(df['Close'])
-        
-        # 4. Current Day Stats
-        latest = df.iloc[-1]
-        atr_val = float(latest['ATR'])
-        current_close = float(latest['Close'])
-        sma_val = float(latest['SMA_50'])
-        rsi_val = float(latest['RSI'])
-        
-        # 5. ADR Exhaustion Logic
-        # Today's Range (High - Low)
-        todays_range = float(latest['High'] - latest['Low'])
-        adr_usage_pct = (todays_range / atr_val) * 100
+        # --- CALC 2: M30 RSI (14) ---
+        df_m30['RSI'] = calculate_rsi(df_m30['Close'])
+        current_rsi = float(df_m30['RSI'].iloc[-1])
         
         return {
-            "atr_pips": atr_val / pip_unit,
-            "current_price": current_close,
-            "sma_50": sma_val,
-            "rsi": rsi_val,
-            "adr_usage": adr_usage_pct
+            "atr_pips": current_atr_val / pip_unit,
+            "rsi_m30": current_rsi,
+            "error": None
         }
-    except:
-        return None
+    except Exception as e:
+        return {"error": str(e)}
 
 # --- MAIN APP UI ---
 
-st.title("🛡️ Forex Risk Dashboard")
+# Refresh Button
+c_refresh, c_title = st.columns([1, 3])
+with c_refresh:
+    if st.button("🔄 Refresh"):
+        st.cache_data.clear()
+        st.rerun()
+with c_title:
+    st.title("Forex Shield")
+
+# Robust Session State for Pair Selection
+if "pair_selection" not in st.session_state:
+    st.session_state.pair_selection = "EUR/USD"
+
+def update_pair():
+    st.session_state.pair_selection = st.session_state.pair_widget
 
 # 1. Top Control Bar
 col_pair, col_link = st.columns([2, 1])
 with col_pair:
-    pair_option = st.radio("Select Pair:", ["EUR/USD", "USD/JPY"], horizontal=True)
+    current_index = 0 if st.session_state.pair_selection == "EUR/USD" else 1
+    
+    pair_option = st.radio(
+        "Select Pair:", 
+        ["EUR/USD", "USD/JPY"], 
+        horizontal=True, 
+        index=current_index,
+        key="pair_widget", 
+        on_change=update_pair
+    )
+
 with col_link:
     st.markdown("")
     st.markdown("")
-    st.markdown("[🔍 **Verify News**](https://www.forexfactory.com/calendar)", unsafe_allow_html=True)
+    st.markdown("[🔍 **Verify**](https://www.forexfactory.com/calendar)", unsafe_allow_html=True)
 
+# Source of Truth
 symbol_map = {"EUR/USD": "EURUSD=X", "USD/JPY": "JPY=X"}
-ticker = symbol_map[pair_option]
-pip_unit = get_pip_unit(pair_option)
+ticker = symbol_map[st.session_state.pair_selection]
+pip_unit = get_pip_unit(st.session_state.pair_selection)
 
 st.divider()
 
-# --- SECTION 2: NEWS FILTER ---
-upcoming_news, passed_news, news_error, last_update = fetch_news(pair_option)
+# --- SECTION 1: SAFETY CHECKS ---
+st.subheader("Environment Status")
 
-# Health Monitor Label
-st.caption(f"News Last Check: {last_update} (Latvia Time)")
+# A. Rollover Check (US Eastern Time)
+ny_tz = pytz.timezone('US/Eastern')
+now_ny = datetime.now(ny_tz)
 
-if news_error:
-    st.warning("⚠️ **Connection Failed:** News data could not be verified. Do not trust the 'Clear Skies' signal. Check ForexFactory manually.")
+ny_minutes = now_ny.hour * 60 + now_ny.minute
+start_minutes = 16 * 60 + 50 # 16:50 NY
+end_minutes = 18 * 60 + 5    # 18:05 NY
+
+is_rollover = False
+if start_minutes <= ny_minutes <= end_minutes:
+    is_rollover = True
+
+# B. Data Fetching
+upcoming_news, passed_news, news_error, last_update = fetch_news(st.session_state.pair_selection)
+market_data = get_market_data(ticker, pip_unit)
+
+# --- MASTER STATUS DISPLAY ---
+now_latvia = datetime.now(USER_TIMEZONE)
+st.caption(f"App Time: {now_latvia.strftime('%H:%M:%S')} (Riga) | News Check: {last_update}")
+
+market_data_healthy = market_data and not market_data.get('error')
+
+if is_rollover:
+    st.error("⚫ **NO TRADE (Rollover)**")
+    st.markdown("Spreads are wide (NY Time 16:50 - 18:05). Scalping is impossible.")
+
+elif news_error:
+    st.warning("⚠️ **Connection Failed.** Check ForexFactory manually.")
+
 elif upcoming_news:
-    st.error(f"⚠️ **CAUTION: {len(upcoming_news)} High Impact Events Upcoming/Active**")
+    st.error(f"⚠️ **DANGER: High Impact News ({len(upcoming_news)})**")
     for news in upcoming_news:
-        st.markdown(f"**{news['time']}** | {news['currency']} | {news['event']}")
+        st.write(f"**{news['time']}** | {news['event']}")
+
+elif not market_data_healthy:
+    st.warning("⚠️ **System Error: Market Data Failed**")
+    st.markdown("RSI/ATR could not be loaded. Trade with caution.")
+
 else:
-    st.success("✅ **Clear Skies (Next 24h)**")
+    st.success("✅ **SAFE TO TRADE**")
+    st.caption("No News. No Spread Spikes. Data Feed Healthy.")
 
 if passed_news:
     with st.expander("Show Completed Events (Today)"):
@@ -197,112 +249,60 @@ if passed_news:
 
 st.divider()
 
-# --- SECTION 3: MASTER SIGNAL (Context) ---
-tech_data = get_technical_analysis(ticker, pip_unit)
-
-if tech_data is None:
-    st.error("Error loading market data.")
-else:
-    # Unpack variables for cleaner logic
-    price = tech_data['current_price']
-    sma = tech_data['sma_50']
-    atr_pips = tech_data['atr_pips']
-    rsi = tech_data['rsi']
-    adr_usage = tech_data['adr_usage']
-    
-    # Calculate Buffer (Rotation Zone) in Price Terms
-    # 0.5 * ATR in price units (not pips)
-    buffer = 0.5 * (atr_pips * pip_unit)
-    
-    # --- THE MASTER LOGIC CHAIN ---
-    
-    signal_color = "black"
-    signal_title = "NO TRADE"
-    signal_reason = "Unknown"
-    
-    # Step 1: Check Fuel (ADR)
-    if adr_usage > 100:
-        signal_color = "black"
-        signal_title = "NO TRADE (Exhausted)"
-        signal_reason = f"Market has moved {adr_usage:.0f}% of daily range. Fuel is empty."
-        
+# --- SECTION 2: MOMENTUM GAUGE (M30 RSI) ---
+if market_data:
+    if market_data.get('error'):
+        st.error(f"Data Error: {market_data['error']}")
     else:
-        # Step 2: Check Trend & Consolidation
-        if price > (sma + buffer):
-            # Potential Uptrend
-            trend_status = "UP"
-        elif price < (sma - buffer):
-            # Potential Downtrend
-            trend_status = "DOWN"
+        rsi = market_data['rsi_m30']
+        
+        st.subheader("Momentum (M30)")
+        
+        if rsi < 25:
+             st.error(f"### 🛑 EXTREME DOWN (RSI {rsi:.0f})")
+             st.markdown("**Market Stretched.** Volatility is high. Wait for stabilization.")
+             
+        elif rsi < 30:
+            st.success(f"### 🟢 OVERSOLD (RSI {rsi:.0f})")
+            st.markdown("**Price Extended.** Monitor structure for reactions.")
+            
+        elif rsi > 75:
+             st.error(f"### 🛑 EXTREME UP (RSI {rsi:.0f})")
+             st.markdown("**Market Stretched.** Volatility is high. Wait for stabilization.")
+             
+        elif rsi > 70:
+            st.warning(f"### 🔴 OVERBOUGHT (RSI {rsi:.0f})")
+            st.markdown("**Price Extended.** Monitor structure for reactions.")
+            
         else:
-            # Inside Buffer
-            trend_status = "FLAT"
-            
-        # Step 3: Check Momentum (RSI) & Final Signal
-        if trend_status == "FLAT":
-            signal_color = "orange"
-            signal_title = "CONSOLIDATION"
-            signal_reason = "Price is rotating near the 50-SMA. Range trading only."
-            
-        elif trend_status == "UP":
-            if rsi > 70:
-                signal_color = "black"
-                signal_title = "NO TRADE (Overbought)"
-                signal_reason = f"Trend is Up, but RSI is {rsi:.0f} (Too high). Wait for pullback."
-            else:
-                signal_color = "green"
-                signal_title = "LONG TRADES ONLY"
-                signal_reason = f"Bullish Trend + Healthy Momentum (RSI {rsi:.0f})."
-                
-        elif trend_status == "DOWN":
-            if rsi < 30:
-                signal_color = "black"
-                signal_title = "NO TRADE (Oversold)"
-                signal_reason = f"Trend is Down, but RSI is {rsi:.0f} (Too low). Wait for pullback."
-            else:
-                signal_color = "red"
-                signal_title = "SHORT TRADES ONLY"
-                signal_reason = f"Bearish Trend + Healthy Momentum (RSI {rsi:.0f})."
+            st.info(f"### ⚪ NORMAL (RSI {rsi:.0f})")
+            st.caption("Momentum is neutral. Rely on Structure.")
+else:
+    st.error("System Error: Could not verify Market Data.")
 
-    # --- DISPLAY MASTER SIGNAL ---
-    st.subheader("Market Context")
+st.divider()
+
+# --- SECTION 3: ATR CALCULATOR ---
+if market_data and not market_data.get('error'):
+    atr_pips = market_data['atr_pips']
     
-    if signal_color == "green":
-        st.success(f"### 🟢 {signal_title}")
-    elif signal_color == "red":
-        st.error(f"### 🔴 {signal_title}")
-    elif signal_color == "orange":
-        st.warning(f"### 🟡 {signal_title}")
-    else:
-        st.info(f"### ⚫ {signal_title}")
-        
-    st.markdown(f"**Analysis:** {signal_reason}")
-    st.caption(f"ADR Usage: {adr_usage:.0f}% | RSI: {rsi:.0f} | SMA Distance: {abs(price-sma)/pip_unit:.0f} pips")
-
-    st.divider()
-
-    # --- SECTION 4: CALCULATOR ---
-    st.subheader("Volatility Targets")
+    st.subheader("Risk Sizing (Daily ATR)")
     
-    # Callback to prevent glitching
     def update_params():
         st.query_params["sl"] = st.session_state.sl_mult
         st.query_params["tp"] = st.session_state.tp_mult
 
-    # Initialize Session State
     if "sl_mult" not in st.session_state:
         qp = st.query_params
-        st.session_state.sl_mult = float(qp.get("sl", 0.50))
-        st.session_state.tp_mult = float(qp.get("tp", 1.00))
+        st.session_state.sl_mult = float(qp.get("sl", 0.20))
+        st.session_state.tp_mult = float(qp.get("tp", 0.15))
 
-    # Input Columns
     c1, c2 = st.columns(2)
     with c1:
         st.number_input("SL Multiplier", key="sl_mult", step=0.01, format="%.2f", on_change=update_params)
     with c2:
         st.number_input("TP Multiplier", key="tp_mult", step=0.01, format="%.2f", on_change=update_params)
         
-    # Final Math
     sl_dist = atr_pips * st.session_state.sl_mult
     tp_dist = atr_pips * st.session_state.tp_mult
 
