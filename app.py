@@ -14,15 +14,37 @@ st.set_page_config(page_title="Forex Safety Shield", layout="centered", page_ico
 USER_TIMEZONE = pytz.timezone('Europe/Riga')
 NEWS_URL = "https://finviz.com/calendar.ashx"
 
-# Whitelist: Critical Events + Liquidity Killers
+# Whitelist: Critical Events + Liquidity Killers + Job Titles
 IMPORTANT_KEYWORDS = [
+    # Inflation & Economy
     "CPI", "Consumer Price Index",
+    "PPI", "Producer Price Index",
+    "PCE", "Personal Consumption Expenditures",
     "GDP", "Gross Domestic Product",
+    "ISM", "Institute for Supply Management",
+    "Retail Sales",
+    "Consumer Confidence", "Sentiment",
+    
+    # Labor Market
     "Nonfarm", "Non-Farm", "Payroll",
     "Unemployment Rate",
+    "JOLTS", "Job Openings",
+    
+    # Central Bank & Policy
     "Interest Rate", "Policy Rate", "Minimum Bid Rate",
     "FOMC", "Monetary Policy",
-    "Speaks", "Testifies", "Chair", "President",
+    "Minutes", "Meeting Minutes",
+    
+    # Auctions (USD/JPY Movers)
+    "Bond Auction", "Note Auction",
+    
+    # Speakers & Titles (Specific Ranks Only)
+    "Testifies", 
+    "Chair", "Vice Chair",
+    "President",
+    "Governor", "Gov",
+    
+    # Liquidity / Market Conditions
     "Holiday", "Closed", "Observance" 
 ]
 
@@ -59,21 +81,28 @@ def convert_to_latvia_time(time_str_est):
 # --- Data Engine 1: News (Cached 1h) ---
 
 @st.cache_data(ttl=3600, show_spinner=False)
-def fetch_news(pair):
+def fetch_news(pair, is_weekend):
     relevant_currencies = pair.split("/")
     upcoming = []
     passed = []
     fetch_time = datetime.now(USER_TIMEZONE).strftime("%H:%M")
     
     try:
-        # FIX: Increased timeout to 15s for mobile reliability
         response = requests.get(NEWS_URL, headers=HEADERS, timeout=15)
         if response.status_code != 200:
             return [], [], True, fetch_time
             
         soup = BeautifulSoup(response.content, "html.parser")
         rows = soup.find_all("tr", class_="calendar-row")
+        
+        # Anti-Captcha Check (Weekday only)
+        if not is_weekend and len(rows) == 0:
+             return [], [], True, fetch_time 
+
         current_riga_time = datetime.now(USER_TIMEZONE)
+        
+        # Lookahead Logic: 72h on Weekends, 24h on Weekdays
+        lookahead_seconds = 259200 if is_weekend else 86400
 
         for row in rows:
             cols = row.find_all("td")
@@ -90,19 +119,27 @@ def fetch_news(pair):
             is_important = any(k.lower() in event_name.lower() for k in IMPORTANT_KEYWORDS)
             if not is_important: continue
             
-            # Filter 3: Time Conversion
+            # Filter 3: Time Conversion & Safety Parsing
             event_dt = convert_to_latvia_time(time_text)
-            if event_dt is None: continue
+            is_tentative = False
             
-            # Filter 4: 24-Hour Lookahead Only
-            if abs((event_dt - current_riga_time).total_seconds()) > 86400:
-                continue
+            if event_dt is None:
+                if "tentative" in time_text.lower() or "all day" in time_text.lower():
+                    is_tentative = True
+                    display_time = "⚠️ Tentative"
+                else:
+                    continue 
+            else:
+                # Filter 4: Dynamic Lookahead
+                if abs((event_dt - current_riga_time).total_seconds()) > lookahead_seconds:
+                    continue
+                display_time = event_dt.strftime("%A %H:%M") if is_weekend else event_dt.strftime("%H:%M")
             
-            display_time = event_dt.strftime("%H:%M")
             event_obj = {"time": display_time, "currency": currency, "event": event_name}
             
-            # Sort: Passed (>1h ago) vs Upcoming/Active
-            if current_riga_time > (event_dt + timedelta(minutes=60)):
+            if is_tentative:
+                upcoming.append(event_obj)
+            elif current_riga_time > (event_dt + timedelta(minutes=60)):
                 passed.append(event_obj)
             else:
                 upcoming.append(event_obj)
@@ -130,6 +167,21 @@ def get_market_data(symbol, pip_unit):
         if df_daily.empty or df_m30.empty: 
             return {"error": "No data returned from Yahoo Finance."}
         
+        # FIX 2: Timezone Aware Freshness Check
+        # Convert index to UTC explicitly to compare apples-to-apples
+        last_candle_time = df_m30.index[-1]
+        if last_candle_time.tzinfo is None:
+             last_candle_time = last_candle_time.replace(tzinfo=pytz.utc)
+        else:
+             last_candle_time = last_candle_time.astimezone(pytz.utc)
+        
+        now_utc = datetime.now(pytz.utc)
+        candle_age_minutes = (now_utc - last_candle_time).total_seconds() / 60
+        
+        is_stale = False
+        if candle_age_minutes > 20: 
+            is_stale = True
+        
         # --- CALC 1: Daily ATR (14) ---
         df_daily['h_l'] = df_daily['High'] - df_daily['Low']
         df_daily['h_pc'] = (df_daily['High'] - df_daily['Close'].shift(1)).abs()
@@ -137,8 +189,6 @@ def get_market_data(symbol, pip_unit):
         df_daily['TR'] = df_daily[['h_l', 'h_pc', 'l_pc']].max(axis=1)
         df_daily['ATR'] = df_daily['TR'].rolling(window=14).mean()
         
-        # FIX: Use iloc[-2] (Yesterday's Closed Candle) for stable sizing
-        # iloc[-1] is the live candle which starts at 0 and causes "Shrinking Ruler" bug
         current_atr_val = float(df_daily['ATR'].iloc[-2])
         
         # --- CALC 2: M30 RSI (14) ---
@@ -148,6 +198,7 @@ def get_market_data(symbol, pip_unit):
         return {
             "atr_pips": current_atr_val / pip_unit,
             "rsi_m30": current_rsi,
+            "is_stale": is_stale, 
             "error": None
         }
     except Exception as e:
@@ -197,6 +248,11 @@ pip_unit = get_pip_unit(st.session_state.pair_selection)
 
 st.divider()
 
+# --- WEEKEND CHECK ---
+now_latvia = datetime.now(USER_TIMEZONE)
+# Saturday = 5, Sunday = 6
+is_weekend = now_latvia.weekday() >= 5
+
 # --- SECTION 1: SAFETY CHECKS ---
 st.subheader("Environment Status")
 
@@ -213,21 +269,28 @@ if start_minutes <= ny_minutes <= end_minutes:
     is_rollover = True
 
 # B. Data Fetching
-upcoming_news, passed_news, news_error, last_update = fetch_news(st.session_state.pair_selection)
-market_data = get_market_data(ticker, pip_unit)
+upcoming_news, passed_news, news_error, last_update = fetch_news(st.session_state.pair_selection, is_weekend)
+
+# Fetch market data ONLY if weekday (saves resources/errors on weekends)
+market_data = None
+if not is_weekend:
+    market_data = get_market_data(ticker, pip_unit)
 
 # --- MASTER STATUS DISPLAY ---
-now_latvia = datetime.now(USER_TIMEZONE)
 st.caption(f"App Time: {now_latvia.strftime('%H:%M:%S')} (Riga) | News Check: {last_update}")
 
 market_data_healthy = market_data and not market_data.get('error')
 
-if is_rollover:
+if is_weekend:
+    st.info("⚪ **MARKET CLOSED (Weekend)**")
+    st.markdown("Showing News Calendar for next 72 hours.")
+
+elif is_rollover:
     st.error("⚫ **NO TRADE (Rollover)**")
     st.markdown("Spreads are wide (NY Time 16:50 - 18:05). Scalping is impossible.")
 
 elif news_error:
-    st.warning("⚠️ **Connection Failed.** Check ForexFactory manually.")
+    st.warning("⚠️ **Connection Failed (Scraper Blocked).** Check ForexFactory manually.")
 
 elif upcoming_news:
     st.error(f"⚠️ **DANGER: High Impact News ({len(upcoming_news)})**")
@@ -238,9 +301,13 @@ elif not market_data_healthy:
     st.warning("⚠️ **System Error: Market Data Failed**")
     st.markdown("RSI/ATR could not be loaded. Trade with caution.")
 
+elif market_data.get('is_stale'):
+    st.warning("⚠️ **Market Data Delayed**")
+    st.markdown("Yahoo Finance data is >20 mins old. RSI is not real-time.")
+
 else:
     st.success("✅ **SAFE TO TRADE**")
-    st.caption("No News. No Spread Spikes. Data Feed Healthy.")
+    st.caption("No News. No Spread Spikes. Data Feed Live.")
 
 if passed_news:
     with st.expander("Show Completed Events (Today)"):
@@ -249,70 +316,73 @@ if passed_news:
 
 st.divider()
 
-# --- SECTION 2: MOMENTUM GAUGE (M30 RSI) ---
-if market_data:
-    if market_data.get('error'):
-        st.error(f"Data Error: {market_data['error']}")
-    else:
-        rsi = market_data['rsi_m30']
-        
-        st.subheader("Momentum (M30)")
-        
-        if rsi < 25:
-             st.error(f"### 🛑 EXTREME DOWN (RSI {rsi:.0f})")
-             st.markdown("**Market Stretched.** Volatility is high. Wait for stabilization.")
-             
-        elif rsi < 30:
-            st.success(f"### 🟢 OVERSOLD (RSI {rsi:.0f})")
-            st.markdown("**Price Extended.** Monitor structure for reactions.")
-            
-        elif rsi > 75:
-             st.error(f"### 🛑 EXTREME UP (RSI {rsi:.0f})")
-             st.markdown("**Market Stretched.** Volatility is high. Wait for stabilization.")
-             
-        elif rsi > 70:
-            st.warning(f"### 🔴 OVERBOUGHT (RSI {rsi:.0f})")
-            st.markdown("**Price Extended.** Monitor structure for reactions.")
-            
+# --- WEEKEND HIDE: RSI & ATR are hidden on Sat/Sun ---
+if not is_weekend:
+
+    # --- SECTION 2: MOMENTUM GAUGE (M30 RSI) ---
+    if market_data:
+        if market_data.get('error'):
+            st.error(f"Data Error: {market_data['error']}")
         else:
-            st.info(f"### ⚪ NORMAL (RSI {rsi:.0f})")
-            st.caption("Momentum is neutral. Rely on Structure.")
-else:
-    st.error("System Error: Could not verify Market Data.")
+            rsi = market_data['rsi_m30']
+            
+            st.subheader("Momentum (M30 - Live Candle)")
+            
+            if rsi < 25:
+                 st.error(f"### 🛑 EXTREME DOWN (RSI {rsi:.0f})")
+                 st.markdown("**Market Stretched.** Volatility is high. Wait for stabilization.")
+                 
+            elif rsi < 30:
+                st.success(f"### 🟢 OVERSOLD (RSI {rsi:.0f})")
+                st.markdown("**Price Extended.** Monitor structure for reactions.")
+                
+            elif rsi > 75:
+                 st.error(f"### 🛑 EXTREME UP (RSI {rsi:.0f})")
+                 st.markdown("**Market Stretched.** Volatility is high. Wait for stabilization.")
+                 
+            elif rsi > 70:
+                st.warning(f"### 🔴 OVERBOUGHT (RSI {rsi:.0f})")
+                st.markdown("**Price Extended.** Monitor structure for reactions.")
+                
+            else:
+                st.info(f"### ⚪ NORMAL (RSI {rsi:.0f})")
+                st.caption("Momentum is neutral. Rely on Structure.")
+    else:
+        st.error("System Error: Could not verify Market Data.")
 
-st.divider()
+    st.divider()
 
-# --- SECTION 3: ATR CALCULATOR ---
-if market_data and not market_data.get('error'):
-    atr_pips = market_data['atr_pips']
-    
-    st.subheader("Risk Sizing (Daily ATR)")
-    
-    def update_params():
-        st.query_params["sl"] = st.session_state.sl_mult
-        st.query_params["tp"] = st.session_state.tp_mult
-
-    if "sl_mult" not in st.session_state:
-        qp = st.query_params
-        st.session_state.sl_mult = float(qp.get("sl", 0.20))
-        st.session_state.tp_mult = float(qp.get("tp", 0.15))
-
-    c1, c2 = st.columns(2)
-    with c1:
-        st.number_input("SL Multiplier", key="sl_mult", step=0.01, format="%.2f", on_change=update_params)
-    with c2:
-        st.number_input("TP Multiplier", key="tp_mult", step=0.01, format="%.2f", on_change=update_params)
+    # --- SECTION 3: ATR CALCULATOR ---
+    if market_data and not market_data.get('error'):
+        atr_pips = market_data['atr_pips']
         
-    sl_dist = atr_pips * st.session_state.sl_mult
-    tp_dist = atr_pips * st.session_state.tp_mult
+        st.subheader("Risk Sizing (Daily ATR)")
+        
+        def update_params():
+            st.query_params["sl"] = st.session_state.sl_mult
+            st.query_params["tp"] = st.session_state.tp_mult
 
-    st.markdown("---")
-    res1, res2 = st.columns(2)
-    with res1:
-        st.markdown(f"<h3 style='text-align: center; color: #ff4b4b;'>STOP LOSS</h3>", unsafe_allow_html=True)
-        st.markdown(f"<h2 style='text-align: center;'>{sl_dist:.1f} pips</h2>", unsafe_allow_html=True)
-    with res2:
-        st.markdown(f"<h3 style='text-align: center; color: #09ab3b;'>TAKE PROFIT</h3>", unsafe_allow_html=True)
-        st.markdown(f"<h2 style='text-align: center;'>{tp_dist:.1f} pips</h2>", unsafe_allow_html=True)
+        if "sl_mult" not in st.session_state:
+            qp = st.query_params
+            st.session_state.sl_mult = float(qp.get("sl", 0.20))
+            st.session_state.tp_mult = float(qp.get("tp", 0.15))
 
-    st.caption(f"Based on Daily ATR (14): {atr_pips:.1f} pips")
+        c1, c2 = st.columns(2)
+        with c1:
+            st.number_input("SL Multiplier", key="sl_mult", step=0.01, format="%.2f", on_change=update_params)
+        with c2:
+            st.number_input("TP Multiplier", key="tp_mult", step=0.01, format="%.2f", on_change=update_params)
+            
+        sl_dist = atr_pips * st.session_state.sl_mult
+        tp_dist = atr_pips * st.session_state.tp_mult
+
+        st.markdown("---")
+        res1, res2 = st.columns(2)
+        with res1:
+            st.markdown(f"<h3 style='text-align: center; color: #ff4b4b;'>STOP LOSS</h3>", unsafe_allow_html=True)
+            st.markdown(f"<h2 style='text-align: center;'>{sl_dist:.1f} pips</h2>", unsafe_allow_html=True)
+        with res2:
+            st.markdown(f"<h3 style='text-align: center; color: #09ab3b;'>TAKE PROFIT</h3>", unsafe_allow_html=True)
+            st.markdown(f"<h2 style='text-align: center;'>{tp_dist:.1f} pips</h2>", unsafe_allow_html=True)
+
+        st.caption(f"Based on Daily ATR (14): {atr_pips:.1f} pips")
