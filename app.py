@@ -138,7 +138,6 @@ elif not market_data_healthy:
 else:
     st.success("✅ **SYSTEM READY**")
     st.caption("Data Feed Live.")
-    st.warning("⚠️ **DID YOU CHECK THE NEWS?**")
 
 st.divider()
 
